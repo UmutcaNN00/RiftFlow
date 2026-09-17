@@ -1,0 +1,22 @@
+﻿# Virtual Environment
+.venv/
+env/
+venv/
+
+# Build & Packaging
+build/
+dist/
+*.spec
+*.zip
+zip_staging/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.class
+*.bak
+*.tmp
+
+# Scratch & Local tests
+scratch/
+test_config.json
