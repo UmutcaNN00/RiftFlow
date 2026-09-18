@@ -1,4 +1,4 @@
-﻿# Virtual Environment
+# Virtual Environment
 .venv/
 env/
 venv/
@@ -20,3 +20,4 @@ __pycache__/
 # Scratch & Local tests
 scratch/
 test_config.json
+cache/

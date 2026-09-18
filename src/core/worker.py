@@ -1,9 +1,9 @@
 import time
 import logging
-import ctypes
 from PySide6.QtCore import QThread, Signal
 from .lcu_client import LcuClient
 from .config import ConfigManager
+from .sound_alert import play_match_found_sound
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +14,7 @@ class LcuWorker(QThread):
     notification = Signal(str)
     log_message = Signal(str)
     champ_select_updated = Signal(str, str)
+    profile_updated = Signal(dict)
 
     def __init__(self, config_manager: ConfigManager, lcu_client: LcuClient, ddragon, parent=None):
         super().__init__(parent)
@@ -27,14 +28,17 @@ class LcuWorker(QThread):
         self.last_connected = None
         self._chat_sent_for_session = False
         self._aram_rerolled = False
+        self._runes_applied_for_session = False
         self._last_selected_champ = ""
         self._last_banned_champ = ""
         self._play_again_done = False
         self._low_spec_minimized = False
-        self._end_emote_done = False
         self._last_swap_check = 0
-        self._last_ff_check = 0
+        self._last_invite_check = 0
+        self._last_sound_time = 0
+        self._last_profile_fetch = 0
         self._accepted_swap_ids = set()
+        self._accepted_invite_ids = set()
         self._last_lock_attempts = {}    # action_id -> timestamp (kilit deneme zamanı)
         self._action_retry_counts = {}   # action_id -> retry count (max retry denetimi)
 
@@ -70,6 +74,10 @@ class LcuWorker(QThread):
                 self.status_changed.emit("Connected")
                 self.log("LoL İstemcisine (LCU) başarıyla bağlandı!")
                 self.last_connected = True
+                self._update_profile_and_rank()
+            elif time.time() - self._last_profile_fetch > 15.0:
+                self._last_profile_fetch = time.time()
+                self._update_profile_and_rank()
             
             phase = self.lcu.get_gameflow_phase()
             if phase is not None:
@@ -81,6 +89,7 @@ class LcuWorker(QThread):
                     if clean_phase != "ChampSelect":
                         self._chat_sent_for_session = False
                         self._aram_rerolled = False
+                        self._runes_applied_for_session = False
                         self._accepted_swap_ids.clear()
                         self._last_lock_attempts.clear()
                         self._action_retry_counts.clear()
@@ -88,11 +97,9 @@ class LcuWorker(QThread):
                         self._last_selected_champ = ""
                         self._last_banned_champ = ""
                         self._play_again_done = False
-                        self._end_emote_done = False
                         self.champ_select_updated.emit("", "")
                     elif clean_phase == "InProgress":
                         self._play_again_done = False
-                        self._end_emote_done = False
                         if self._last_selected_champ:
                             self.champ_select_updated.emit(self._last_selected_champ, self._last_banned_champ)
 
@@ -100,17 +107,20 @@ class LcuWorker(QThread):
                     self.handle_ready_check()
                 elif clean_phase == "ChampSelect":
                     self.handle_champ_select()
-                elif clean_phase == "Lobby":
-                    if self.config.get("auto_queue", False):
-                        self.lcu.start_matchmaking()
-                    if self.config.get("auto_party_ready", False):
-                        self.handle_party_ready()
-                    if self._low_spec_minimized:
-                        try:
-                            self.lcu.request("POST", "/riotclient/ux-show")
-                        except Exception:
-                            pass
-                        self._low_spec_minimized = False
+                elif clean_phase in ("Lobby", "None"):
+                    if self.config.get("auto_accept_invites", False):
+                        self.handle_incoming_invites()
+                    if clean_phase == "Lobby":
+                        if self.config.get("auto_queue", False):
+                            self.lcu.start_matchmaking()
+                        if self.config.get("auto_party_ready", False):
+                            self.handle_party_ready()
+                        if self._low_spec_minimized:
+                            try:
+                                self.lcu.request("POST", "/riotclient/ux-show")
+                            except Exception:
+                                pass
+                            self._low_spec_minimized = False
                 elif clean_phase == "InProgress":
                     if self.config.get("auto_low_spec", False) and not self._low_spec_minimized:
                         try:
@@ -119,14 +129,7 @@ class LcuWorker(QThread):
                             self.log("Düşük Donanım Modu: İstemci arka plana küçültüldü (FPS Boost aktif).")
                         except Exception:
                             pass
-                    if self.config.get("auto_no_ff", False):
-                        self.handle_auto_no_ff()
-                elif clean_phase == "PreEndOfGame":
-                    if self.config.get("auto_end_emote", False) and not self._end_emote_done:
-                        self.handle_end_emote()
-                    if self.config.get("auto_play_again", False) and not self._play_again_done:
-                        self.handle_play_again()
-                elif clean_phase in ("EndOfGame", "WaitingForStats"):
+                elif clean_phase in ("PreEndOfGame", "EndOfGame", "WaitingForStats"):
                     if self._low_spec_minimized:
                         try:
                             self.lcu.request("POST", "/riotclient/ux-show")
@@ -142,10 +145,15 @@ class LcuWorker(QThread):
             self._is_polling = False
 
     def handle_ready_check(self):
+        current_time = time.time()
+        if self.config.get("play_sound_on_ready", True):
+            if current_time - self._last_sound_time > 5.0:
+                self._last_sound_time = current_time
+                play_match_found_sound()
+
         if not self.config.get("auto_accept", False):
             return
             
-        current_time = time.time()
         if current_time - self.last_accept_time > 4.0:
             delay = self.config.get("accept_delay", 0)
             if delay > 0:
@@ -194,6 +202,15 @@ class LcuWorker(QThread):
             self.handle_swap_accept()
 
         local_player_cell_id = session.get("localPlayerCellId")
+
+        # ARAM Auto Bench Sniper
+        if self.config.get("auto_bench_sniper", False):
+            self.handle_bench_sniper(session, local_player_cell_id)
+
+        # Auto Recommended Runes
+        if self.config.get("auto_recommended_runes", False) and not self._runes_applied_for_session:
+            self.handle_auto_runes(session, local_player_cell_id)
+
         actions = session.get("actions", [])
         
         # Extract live picked champion and banned champion for user
@@ -433,36 +450,82 @@ class LcuWorker(QThread):
         except Exception:
             pass
 
-    def handle_end_emote(self):
+    def handle_bench_sniper(self, session, local_player_cell_id):
+        bench = session.get("benchChampions", [])
+        if not bench:
+            return
+        bench_ids = [b.get("championId") for b in bench if b.get("championId")]
+        if not bench_ids:
+            return
+
+        my_cur_id = 0
+        for p in session.get("myTeam", []):
+            if p.get("cellId") == local_player_cell_id:
+                my_cur_id = p.get("championId") or 0
+                break
+
+        # Preferences in priority order 1, 2, 3
+        for pref_key in ("pick_preference_1", "pick_preference_2", "pick_preference_3"):
+            cname = self.config.get(pref_key)
+            if not cname or cname in ("None", ""):
+                continue
+            tid = self.ddragon.get_champion_id(cname)
+            if tid and tid in bench_ids and tid != my_cur_id:
+                if self.lcu.swap_bench_champion(tid):
+                    champ_display = self.ddragon.get_champion_name(tid)
+                    self.log(f"ARAM Bench Sniper: {champ_display} kulübeden anında kapıldı!")
+                    break
+
+    def handle_auto_runes(self, session, local_player_cell_id):
+        locked_cid = 0
+        for p in session.get("myTeam", []):
+            if p.get("cellId") == local_player_cell_id:
+                cid = p.get("championId")
+                if cid and cid > 0:
+                    locked_cid = cid
+                break
+        if locked_cid > 0:
+            if self.lcu.apply_recommended_runes(locked_cid):
+                self._runes_applied_for_session = True
+                champ_display = self.ddragon.get_champion_name(locked_cid)
+                self.log(f"Otomatik Rün: {champ_display} için en yüksek kazanma oranlı meta rünler içe aktarıldı!")
+
+    def handle_incoming_invites(self):
+        now = time.time()
+        if now - self._last_invite_check < 2.0:
+            return
+        self._last_invite_check = now
         try:
-            hwnd = ctypes.windll.user32.GetForegroundWindow()
-            buf = ctypes.create_unicode_buffer(256)
-            ctypes.windll.user32.GetWindowTextW(hwnd, buf, 256)
-            if "League of Legends" in buf.value:
-                # Ctrl + 6 (Mastery Emote)
-                ctypes.windll.user32.keybd_event(0x11, 0, 0, 0)
-                ctypes.windll.user32.keybd_event(0x36, 0, 0, 0)
-                self.msleep(50)
-                ctypes.windll.user32.keybd_event(0x36, 0, 2, 0)
-                ctypes.windll.user32.keybd_event(0x11, 0, 2, 0)
-                self.log("Maç Sonu: Otomatik GG / Ustalık İfadesi patlatıldı!")
+            invites = self.lcu.get_received_invitations()
+            if isinstance(invites, list):
+                for inv in invites:
+                    inv_id = inv.get("invitationId") or inv.get("id")
+                    from_name = inv.get("fromSummonerName") or "Lobi Arkadaşı"
+                    state = str(inv.get("state", "")).upper()
+                    if inv_id and state in ("PENDING", "RECEIVED", "") and inv_id not in self._accepted_invite_ids:
+                        if self.lcu.accept_invitation(inv_id):
+                            self._accepted_invite_ids.add(inv_id)
+                            self.log(f"Gelen lobi daveti otomatik kabul edildi! ({from_name})")
         except Exception:
             pass
-        self._end_emote_done = True
 
-    def handle_auto_no_ff(self):
-        now = time.time()
-        if now - self._last_ff_check < 4.0:
-            return
-        self._last_ff_check = now
+    def _update_profile_and_rank(self):
         try:
-            hwnd = ctypes.windll.user32.GetForegroundWindow()
-            buf = ctypes.create_unicode_buffer(256)
-            ctypes.windll.user32.GetWindowTextW(hwnd, buf, 256)
-            if "League of Legends" in buf.value:
-                # F6 is default surrender NO key in LoL
-                ctypes.windll.user32.keybd_event(0x75, 0, 0, 0)
-                self.msleep(40)
-                ctypes.windll.user32.keybd_event(0x75, 0, 2, 0)
+            s_info = self.lcu.get_summoner_info()
+            r_info = self.lcu.get_ranked_stats()
+            combined = {}
+            if isinstance(s_info, dict):
+                combined.update(s_info)
+            if isinstance(r_info, dict):
+                queues = r_info.get("queues", [])
+                solo_queue = next((q for q in queues if q.get("queueType") == "RANKED_SOLO_5x5"), None)
+                if solo_queue:
+                    combined["tier"] = solo_queue.get("tier", "UNRANKED")
+                    combined["division"] = solo_queue.get("division", "")
+                    combined["leaguePoints"] = solo_queue.get("leaguePoints", 0)
+                    combined["wins"] = solo_queue.get("wins", 0)
+                    combined["losses"] = solo_queue.get("losses", 0)
+            if combined:
+                self.profile_updated.emit(combined)
         except Exception:
             pass

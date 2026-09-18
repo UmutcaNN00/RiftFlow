@@ -253,6 +253,100 @@ class LcuClient:
             logger.error(f"Failed to send chat message: {e}")
         return False
 
+    def get_bench_champions(self):
+        try:
+            session = self.get_champ_select_session()
+            if session and isinstance(session, dict):
+                return session.get("benchChampions", [])
+        except Exception:
+            pass
+        return []
+
+    def swap_bench_champion(self, champ_id):
+        try:
+            self.request("POST", f"/lol-champ-select/v1/session/bench/swap/{int(champ_id)}")
+            return True
+        except Exception as e:
+            logger.debug(f"Bench swap failed for champ {champ_id}: {e}")
+            return False
+
+    def get_received_invitations(self):
+        try:
+            res = self.request("GET", "/lol-lobby/v2/received-invitations")
+            if isinstance(res, list):
+                return res
+        except Exception:
+            pass
+        return []
+
+    def accept_invitation(self, invitation_id):
+        try:
+            self.request("POST", f"/lol-lobby/v2/received-invitations/{invitation_id}/accept")
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to accept invitation {invitation_id}: {e}")
+            return False
+
+    def reroll_aram(self):
+        try:
+            self.request("POST", "/lol-champ-select/v1/session/my-selection/reroll")
+            return True
+        except Exception as e:
+            logger.debug(f"ARAM reroll failed: {e}")
+            return False
+
+    def get_ranked_stats(self):
+        try:
+            return self.request("GET", "/lol-ranked/v1/current-ranked-stats")
+        except Exception:
+            return None
+
+    def apply_recommended_runes(self, champion_id):
+        """
+        Fetches official Riot recommended runes for the given champion and sets
+        or replaces the active perk page.
+        """
+        try:
+            rec_pages = self.request("GET", "/lol-perks/v1/recommended-pages")
+            if not isinstance(rec_pages, list) or not rec_pages:
+                return False
+
+            target_page = None
+            for p in rec_pages:
+                if p.get("championId") == int(champion_id):
+                    target_page = p
+                    break
+            if not target_page:
+                target_page = rec_pages[0]
+
+            name = f"RiftFlow: {target_page.get('name', 'Meta')[:18]}"
+            primary_style = target_page.get("primaryPerkStyleId")
+            sub_style = target_page.get("subStyleId")
+            selected_perks = target_page.get("selectedPerkIds", [])
+
+            page_payload = {
+                "name": name,
+                "primaryStyleId": primary_style,
+                "subStyleId": sub_style,
+                "selectedPerkIds": selected_perks,
+                "current": True
+            }
+
+            cur_page = self.request("GET", "/lol-perks/v1/currentpage")
+            if cur_page and isinstance(cur_page, dict) and cur_page.get("isEditable", True):
+                page_id = cur_page.get("id")
+                if page_id:
+                    self.request("PUT", f"/lol-perks/v1/pages/{page_id}", json=page_payload)
+                    logger.info(f"Recommended runes updated on page {page_id}")
+                    return True
+
+            self.request("POST", "/lol-perks/v1/pages", json=page_payload)
+            logger.info("Recommended runes applied via POST /lol-perks/v1/pages")
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to apply recommended runes: {e}")
+            return False
+
     def close(self):
         try:
             self.session.close()

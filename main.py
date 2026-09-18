@@ -11,6 +11,7 @@ def main():
     except Exception:
         pass
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
     window = MainWindowV2()
     window.show()
     sys.exit(app.exec())

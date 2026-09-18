@@ -207,4 +207,83 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
 QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
     background: none;
 }
+#createLobbyBtn {
+    background-color: #0AC8B9;
+    border: 1px solid #0AC8B9;
+    color: #0F1218;
+    font-weight: bold;
+    padding: 8px 14px;
+    border-radius: 6px;
+    font-size: 13px;
+}
+#createLobbyBtn:hover {
+    background-color: #12E6D5;
+    border: 1px solid #12E6D5;
+}
+#testSoundBtn {
+    background-color: #1F2533;
+    border: 1px solid #2D374D;
+    color: #00D4FF;
+    font-weight: bold;
+    padding: 6px 14px;
+    border-radius: 6px;
+}
+#testSoundBtn:hover {
+    background-color: #283247;
+    border-color: #00D4FF;
+}
+#presetBtn {
+    background-color: #181B22;
+    border: 1px solid #252A36;
+    color: #8A9AAB;
+    padding: 3px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+}
+#presetBtn:hover {
+    background-color: #222631;
+    color: #0AC8B9;
+    border-color: #0AC8B9;
+}
+#laneBtn {
+    background-color: #181B22;
+    border: 1px solid #282C38;
+    color: #8A9AAB;
+    font-weight: bold;
+    font-size: 12px;
+    border-radius: 8px;
+    padding: 8px 10px;
+}
+#laneBtn:hover {
+    background-color: #222631;
+    color: #FFFFFF;
+    border-color: #3C4254;
+}
+#laneBtn[roleState="primary"] {
+    background-color: #0AC8B9;
+    border: 1px solid #0AC8B9;
+    color: #0F1218;
+}
+#laneBtn[roleState="secondary"] {
+    background-color: #7952B3;
+    border: 1px solid #9A6EE2;
+    color: #FFFFFF;
+}
+#repeatBtn {
+    background-color: #1A1C23;
+    border: 1px solid #2A2D36;
+    border-radius: 6px;
+    padding: 5px;
+    color: #8A9AAB;
+    font-weight: bold;
+}
+#repeatBtn:hover {
+    color: #FFFFFF;
+    border-color: #3A3D46;
+}
+#repeatBtn:checked {
+    background-color: #0AC8B9;
+    color: #17181D;
+    border-color: #0AC8B9;
+}
 """
