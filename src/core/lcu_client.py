@@ -138,43 +138,66 @@ class LcuClient:
             return None
 
     def hover_champion(self, action_id, champ_id):
-        try:
-            self.request("PATCH", f"/lol-champ-select/v1/session/actions/{action_id}", json={"championId": int(champ_id)})
-            return True
-        except Exception as e:
-            logger.debug(f"Hover error on action {action_id}: {e}")
-            return False
+        champ_id = int(champ_id)
+        for prefix in ("/lol-champ-select/v1/session/actions", "/lol-champ-select-legacy/v1/session/actions"):
+            try:
+                self.request("PATCH", f"{prefix}/{action_id}", json={
+                    "championId": champ_id,
+                    "completed": False
+                })
+                return True
+            except Exception:
+                try:
+                    self.request("PATCH", f"{prefix}/{action_id}", json={
+                        "championId": champ_id
+                    })
+                    return True
+                except Exception as e:
+                    logger.debug(f"Hover error on {prefix}/{action_id}: {e}")
+        return False
 
     def lock_champion(self, action_id, champ_id, action_type=None):
         champ_id = int(champ_id)
-        
-        # 1. Step 1: Ensure the champion is set on the action (Hover/Select)
-        try:
-            self.request("PATCH", f"/lol-champ-select/v1/session/actions/{action_id}", json={"championId": champ_id})
-        except Exception as e:
-            logger.debug(f"Pre-lock hover on action {action_id}: {e}")
+        logger.info(f"lock_champion called: action {action_id}, champ {champ_id}, type {action_type}")
 
-        # 2. Step 2: Brief pause (80ms) for LCU state machine to register the champion
+        # Step 1: PATCH action with championId & completed: True (Primary & Universal LCU lock mechanism)
+        for prefix in ("/lol-champ-select/v1/session/actions", "/lol-champ-select-legacy/v1/session/actions"):
+            try:
+                res = self.request("PATCH", f"{prefix}/{action_id}", json={
+                    "championId": champ_id,
+                    "completed": True
+                })
+                if isinstance(res, dict) and res.get("completed") is True:
+                    logger.info(f"Action {action_id} verified completed via PATCH {prefix}.")
+                    return True
+            except Exception as e:
+                logger.debug(f"PATCH {prefix}/{action_id} completed:True error: {e}")
+
+        # Step 2: Ensure championId is set, then invoke POST /complete (trigger without body)
+        for prefix in ("/lol-champ-select/v1/session/actions", "/lol-champ-select-legacy/v1/session/actions"):
+            try:
+                self.request("PATCH", f"{prefix}/{action_id}", json={"championId": champ_id})
+                time.sleep(0.05)
+                url = f"{self.get_base_url()}{prefix}/{action_id}/complete"
+                resp = self.session.post(url, timeout=3)
+                if resp.status_code in (200, 204):
+                    logger.info(f"POST {prefix}/{action_id}/complete status {resp.status_code}")
+            except Exception as e:
+                logger.debug(f"POST {prefix}/{action_id}/complete error: {e}")
+
+        # Step 3: Definitive ground-truth verification from live session state
         time.sleep(0.08)
-
-        # 3. Step 3: Primary lock via POST /complete (Official LCU method)
         try:
-            self.request("POST", f"/lol-champ-select/v1/session/actions/{action_id}/complete", json={})
-            logger.info(f"Action {action_id} locked successfully via POST /complete.")
-            return True
-        except Exception as post_err:
-            logger.debug(f"POST /complete on action {action_id} failed: {post_err}. Trying PATCH fallback...")
-
-        # 4. Step 4: Fallback lock via atomic PATCH with completed: True (Never pass 'type' or read-only fields)
-        try:
-            self.request("PATCH", f"/lol-champ-select/v1/session/actions/{action_id}", json={
-                "championId": champ_id,
-                "completed": True
-            })
-            logger.info(f"Action {action_id} locked successfully via PATCH completed: True.")
-            return True
-        except Exception as patch_err:
-            logger.error(f"PATCH fallback lock failed on action {action_id}: {patch_err}")
+            sess = self.get_champ_select_session()
+            if sess and isinstance(sess, dict):
+                for group in sess.get("actions", []):
+                    for act in group:
+                        if act.get("id") == action_id:
+                            is_done = bool(act.get("completed"))
+                            logger.info(f"Action {action_id} live completed check: {is_done}")
+                            return is_done
+        except Exception as e:
+            logger.debug(f"Session verify error on action {action_id}: {e}")
 
         return False
             

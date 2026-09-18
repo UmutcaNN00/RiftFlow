@@ -89,6 +89,9 @@ class LcuWorker(QThread):
                         self._spells_applied_for_session = False
                         self._last_lock_attempts.clear()
                         self._action_retry_counts.clear()
+                    else:
+                        self._last_lock_attempts.clear()
+                        self._action_retry_counts.clear()
                     if clean_phase in ("Lobby", "None", "Matchmaking"):
                         self._last_selected_champ = ""
                         self._last_banned_champ = ""
@@ -251,9 +254,17 @@ class LcuWorker(QThread):
         if not self.config.get("auto_pick", True):
             return
 
+        retries = self._action_retry_counts.get(action_id, 0)
+        # Dynamic fallback: if priority 1 fails repeatedly (e.g. taken/disabled), try priority 2, then 3
+        pref_start = 1
+        if retries >= 4:
+            pref_start = 2
+        if retries >= 8:
+            pref_start = 3
+
         target_champ = None
         target_name = None
-        for i in range(1, 4):
+        for i in range(pref_start, 4):
             champ_name = self.config.get(f"pick_preference_{i}")
             if not champ_name or champ_name == "None": continue
             champ_id = self.ddragon.get_champion_id(champ_name)
@@ -265,40 +276,49 @@ class LcuWorker(QThread):
         if not target_champ:
             return
 
-        # 1. Önseçim / Hover: Sıra henüz bizde değilse niyet göster
+        # 1. Önseçim / Hover: Sıra henüz bizde değilken (PLANNING veya bekleme) niyet göster
         if not is_in_progress:
-            is_hovered = action.get("championId") == target_champ
+            is_hovered = (action.get("championId") == target_champ)
             if not is_hovered:
                 self.log(f"Şampiyon gösteriliyor (Önseçim/Hover): {target_name} (ID: {target_champ})")
                 self.lcu.hover_champion(action_id, target_champ)
             return
 
-        # 2. Seçim sırası bizde (isInProgress == True)! Kilitleme denetimi
+        # 2. Seçim sırası bizde (isInProgress == True)! Sürekli ve kararlı kilitleme denetimi
         now = time.time()
-        if now - self._last_lock_attempts.get(action_id, 0) < 1.2:
+        if now - self._last_lock_attempts.get(action_id, 0) < 0.9:
             return
-
-        retries = self._action_retry_counts.get(action_id, 0)
-        if retries >= 3:
-            return  # Sonsuz döngü ve LCU spam engeli
 
         self._last_lock_attempts[action_id] = now
         self._action_retry_counts[action_id] = retries + 1
 
-        self.log(f"Sıra bizde! Şampiyon kilitleniyor: {target_name} (ID: {target_champ})")
+        self.log(f"Sıra bizde! Şampiyon kilitleniyor: {target_name} (ID: {target_champ}) [Deneme #{retries + 1}]")
         if self.lcu.lock_champion(action_id, target_champ, "pick"):
             self.champ_selected.emit(target_champ)
             self.log(f"Şampiyon başarıyla kilitlendi: {target_name}")
+            self._last_selected_champ = target_name
         else:
-            self.log(f"Şampiyon kilitleme başarısız: {target_name}, 1.2 sn sonra tekrar denenecek.")
+            self.log(f"Şampiyon kilitleme henüz tamamlanamadı: {target_name}, tekrar deneniyor...")
 
     def handle_ban_action(self, action_id, action, unselectable, is_in_progress, phase=""):
         if not self.config.get("auto_ban", self.config.get("auto_lock", True)):
             return
 
+        # Ban işlemi SADECE ban sırası aktifken (is_in_progress == True) çalışmalıdır.
+        if not is_in_progress:
+            return
+
+        retries = self._action_retry_counts.get(action_id, 0)
+        # Dynamic fallback: if priority 1 fails repeatedly, try priority 2, then 3
+        pref_start = 1
+        if retries >= 4:
+            pref_start = 2
+        if retries >= 8:
+            pref_start = 3
+
         target_ban = None
         target_name = None
-        for i in range(1, 4):
+        for i in range(pref_start, 4):
             champ_name = self.config.get(f"ban_preference_{i}")
             if not champ_name or champ_name == "None": continue
             champ_id = self.ddragon.get_champion_id(champ_name)
@@ -310,32 +330,19 @@ class LcuWorker(QThread):
         if not target_ban:
             return
 
-        # 1. Ban adayını hover yap (kullanıcı ve takım görsün)
-        is_hovered = action.get("championId") == target_ban
-        if not is_hovered:
-            self.log(f"Ban adayı gösteriliyor: {target_name}")
-            self.lcu.hover_champion(action_id, target_ban)
-
-        # 2. Ban sırası aktifken kilitle
-        if not is_in_progress:
-            return
-
         now = time.time()
-        if now - self._last_lock_attempts.get(action_id, 0) < 1.2:
+        if now - self._last_lock_attempts.get(action_id, 0) < 0.9:
             return
-
-        retries = self._action_retry_counts.get(action_id, 0)
-        if retries >= 3:
-            return  # Sonsuz döngü ve LCU spam engeli
 
         self._last_lock_attempts[action_id] = now
         self._action_retry_counts[action_id] = retries + 1
 
-        self.log(f"Ban sırası aktif! Ban kilitleniyor: {target_name} (ID: {target_ban})")
+        self.log(f"Ban sırası aktif! Ban kilitleniyor: {target_name} (ID: {target_ban}) [Deneme #{retries + 1}]")
         if self.lcu.lock_champion(action_id, target_ban, "ban"):
             self.log(f"Ban başarıyla kilitlendi: {target_name}")
+            self._last_banned_champ = target_name
         else:
-            self.log(f"Ban kilitleme başarısız: {target_name}, 1.2 sn sonra tekrar denenecek.")
+            self.log(f"Ban kilitleme henüz tamamlanamadı: {target_name}, tekrar deneniyor...")
 
     def handle_smart_spells(self, session, local_player_cell_id):
         # 4: Flash, 11: Smite, 14: Ignite, 12: Teleport, 7: Heal, 3: Exhaust, 6: Ghost
