@@ -35,7 +35,8 @@ class LcuWorker(QThread):
         self._last_swap_check = 0
         self._last_ff_check = 0
         self._accepted_swap_ids = set()
-        self._last_lock_attempts = {}  # action_id -> timestamp (kilit deneme zamanı)
+        self._last_lock_attempts = {}    # action_id -> timestamp (kilit deneme zamanı)
+        self._action_retry_counts = {}   # action_id -> retry count (max retry denetimi)
 
     def run(self):
         while self._running:
@@ -81,7 +82,8 @@ class LcuWorker(QThread):
                         self._chat_sent_for_session = False
                         self._aram_rerolled = False
                         self._accepted_swap_ids.clear()
-                        self._last_lock_attempts.clear()  # Yeni ChampSelect için sıfırla
+                        self._last_lock_attempts.clear()
+                        self._action_retry_counts.clear()
                     if clean_phase in ("Lobby", "None", "Matchmaking"):
                         self._last_selected_champ = ""
                         self._last_banned_champ = ""
@@ -272,9 +274,9 @@ class LcuWorker(QThread):
                 break
 
         if not target_champ:
-                        return
-                
-        # 1. Sıra henüz bizde değilse: sadece niyet göster (hover)
+            return
+
+        # 1. Önseçim / Hover: Sıra henüz bizde değilse niyet göster
         if not is_in_progress:
             is_hovered = action.get("championId") == target_champ
             if not is_hovered:
@@ -282,26 +284,27 @@ class LcuWorker(QThread):
                 self.lcu.hover_champion(action_id, target_champ)
             return
 
-        # 2. Sıra bizde! Kilitleme denemesi yap
+        # 2. Seçim sırası bizde (isInProgress == True)! Kilitleme denetimi
         now = time.time()
-        if now - self._last_lock_attempts.get(action_id, 0) < 0.5:
+        if now - self._last_lock_attempts.get(action_id, 0) < 1.2:
             return
+
+        retries = self._action_retry_counts.get(action_id, 0)
+        if retries >= 3:
+            return  # Sonsuz döngü ve LCU spam engeli
+
         self._last_lock_attempts[action_id] = now
+        self._action_retry_counts[action_id] = retries + 1
 
         self.log(f"Sıra bizde! Şampiyon kilitleniyor: {target_name} (ID: {target_champ})")
         if self.lcu.lock_champion(action_id, target_champ, "pick"):
             self.champ_selected.emit(target_champ)
             self.log(f"Şampiyon başarıyla kilitlendi: {target_name}")
         else:
-            self.log(f"Şampiyon kilitleme başarısız: {target_name}, tekrar denenecek.")
-            self._last_lock_attempts[action_id] = 0  # Başarısız olursa anında tekrar denesin
+            self.log(f"Şampiyon kilitleme başarısız: {target_name}, 1.2 sn sonra tekrar denenecek.")
 
     def handle_ban_action(self, action_id, action, unselectable, is_in_progress, phase=""):
         if not self.config.get("auto_ban", self.config.get("auto_lock", True)):
-            return
-
-        # Ban sırası aktif değilse bekle
-        if not is_in_progress:
             return
 
         target_ban = None
@@ -325,17 +328,25 @@ class LcuWorker(QThread):
             self.lcu.hover_champion(action_id, target_ban)
 
         # 2. Ban sırası aktifken kilitle
-        now = time.time()
-        if now - self._last_lock_attempts.get(action_id, 0) < 0.5:
+        if not is_in_progress:
             return
+
+        now = time.time()
+        if now - self._last_lock_attempts.get(action_id, 0) < 1.2:
+            return
+
+        retries = self._action_retry_counts.get(action_id, 0)
+        if retries >= 3:
+            return  # Sonsuz döngü ve LCU spam engeli
+
         self._last_lock_attempts[action_id] = now
+        self._action_retry_counts[action_id] = retries + 1
 
         self.log(f"Ban sırası aktif! Ban kilitleniyor: {target_name} (ID: {target_ban})")
         if self.lcu.lock_champion(action_id, target_ban, "ban"):
             self.log(f"Ban başarıyla kilitlendi: {target_name}")
         else:
-            self.log(f"Ban kilitleme başarısız: {target_name}, tekrar denenecek.")
-            self._last_lock_attempts[action_id] = 0  # Başarısız olursa anında tekrar denesin
+            self.log(f"Ban kilitleme başarısız: {target_name}, 1.2 sn sonra tekrar denenecek.")
 
     def handle_party_ready(self):
         try:
