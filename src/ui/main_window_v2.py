@@ -2,25 +2,44 @@ import os
 import sys
 import time
 import requests
-import winreg
+import webbrowser
 import logging
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QGroupBox, QSlider, QLabel, QComboBox, QPushButton, QSpacerItem, QSizePolicy,
     QStackedWidget, QButtonGroup, QSpinBox, QLineEdit, QTextEdit, QScrollArea, QFrame,
-    QSystemTrayIcon, QMenu, QApplication
+    QApplication
 )
 from PySide6.QtCore import Qt, QSize, Signal, QRectF, QPropertyAnimation, Property, QEasingCurve
-from PySide6.QtGui import QPixmap, QIcon, QPainter, QColor, QFont, QPainterPath, QAction
+from PySide6.QtGui import QPixmap, QIcon, QPainter, QColor, QFont, QPainterPath
 
 from src.core.config import ConfigManager
 from src.core.worker import LcuWorker
 from src.core.lcu_client import LcuClient
 from src.core.data_dragon import DataDragon
-from src.core.sound_alert import test_sound
 from src.ui.modern_theme import MODERN_THEME
 
 logger = logging.getLogger(__name__)
+
+# Canonical LCU Position Map
+ROLE_CANONICAL_MAP = {
+    "TOP": "TOP",
+    "JUNGLE": "JUNGLE", "JGL": "JUNGLE",
+    "MIDDLE": "MIDDLE", "MID": "MIDDLE",
+    "BOTTOM": "BOTTOM", "ADC": "BOTTOM", "BOT": "BOTTOM",
+    "UTILITY": "UTILITY", "SUP": "UTILITY", "SUPPORT": "UTILITY",
+    "FILL": "FILL",
+    "UNSELECTED": "UNSELECTED"
+}
+
+ROLE_DEFINITIONS = [
+    ("TOP", "ÜST"),
+    ("JUNGLE", "ORMAN"),
+    ("MIDDLE", "ORTA"),
+    ("BOTTOM", "ALT"),
+    ("UTILITY", "DESTEK"),
+    ("FILL", "DOLDUR")
+]
 
 class ModernSwitch(QWidget):
     toggled = Signal(bool)
@@ -72,13 +91,13 @@ class ModernSwitch(QWidget):
         h = self.height()
         radius = h / 2.0
         
-        # Color interpolation for track: Off: #1A1D26, On: #0AC8B9
+        # Color interpolation: Off: #1A1D26, On: #0AC8B9
         r = int(26 + (10 - 26) * self._pos)
         g = int(29 + (200 - 29) * self._pos)
         b = int(38 + (185 - 38) * self._pos)
         bg_color = QColor(r, g, b)
         
-        # Border color: #2E3445 (off) -> #12E6D5 (on)
+        # Border color: #2E3445 -> #12E6D5
         br = int(46 + (18 - 46) * self._pos)
         bg = int(52 + (230 - 52) * self._pos)
         bb = int(69 + (213 - 69) * self._pos)
@@ -88,7 +107,6 @@ class ModernSwitch(QWidget):
         path = QPainterPath()
         path.addRoundedRect(0.5, 0.5, w - 1.0, h - 1.0, radius, radius)
         p.fillPath(path, bg_color)
-        
         p.setPen(border_color)
         p.drawPath(path)
         
@@ -97,133 +115,159 @@ class ModernSwitch(QWidget):
         thumb_x = 3.0 + self._pos * (w - thumb_diam - 6.0)
         thumb_y = 3.0
         
-        # Thumb soft drop shadow
+        # Soft drop shadow
         shadow_rect = QRectF(thumb_x, thumb_y + 1.0, thumb_diam, thumb_diam)
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(0, 0, 0, 60))
         p.drawEllipse(shadow_rect)
         
-        # Thumb body
+        # Thumb circle
         thumb_rect = QRectF(thumb_x, thumb_y, thumb_diam, thumb_diam)
         p.setBrush(QColor("#FFFFFF"))
         p.drawEllipse(thumb_rect)
 
 
-class ModernRoleSelector(QWidget):
+class DualRowRoleSelector(QWidget):
     roles_changed = Signal(str, str)  # (primary, secondary)
-
-    ROLES = [
-        ("TOP", "Üst Koridor"),
-        ("JUNGLE", "Orman"),
-        ("MIDDLE", "Orta"),
-        ("BOTTOM", "Alt Koridor"),
-        ("UTILITY", "Destek"),
-        ("FILL", "Doldur")
-    ]
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.primary_role = "BOTTOM"
         self.secondary_role = "UTILITY"
-        self.buttons = {}
+        self.primary_buttons = {}
+        self.secondary_buttons = {}
         self.init_ui()
 
     def init_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(6)
 
-        grid = QGridLayout()
-        grid.setSpacing(6)
+        # 1. Satır: Birincil Rol
+        lbl_pri = QLabel("Birincil Rol (1. Tercih):")
+        lbl_pri.setStyleSheet("color: #0AC8B9; font-weight: bold; font-size: 11px;")
+        main_layout.addWidget(lbl_pri)
 
-        for i, (role_code, role_name) in enumerate(self.ROLES):
-            btn = QPushButton(role_name)
+        row1_layout = QHBoxLayout()
+        row1_layout.setSpacing(4)
+        for role_code, label in ROLE_DEFINITIONS:
+            btn = QPushButton(label)
             btn.setObjectName("laneBtn")
             btn.setCursor(Qt.PointingHandCursor)
-            btn.clicked.connect(lambda _, r=role_code: self.on_lane_clicked(r))
-            self.buttons[role_code] = btn
-            grid.addWidget(btn, i // 3, i % 3)
+            btn.clicked.connect(lambda _, r=role_code: self.on_primary_clicked(r))
+            self.primary_buttons[role_code] = btn
+            row1_layout.addWidget(btn)
+        main_layout.addLayout(row1_layout)
 
-        layout.addLayout(grid)
-        self.update_buttons()
+        # 2. Satır: İkincil Rol
+        self.lbl_sec = QLabel("İkincil Rol (2. Tercih):")
+        self.lbl_sec.setStyleSheet("color: #9A6EE2; font-weight: bold; font-size: 11px;")
+        main_layout.addWidget(self.lbl_sec)
 
-    def on_lane_clicked(self, role_code):
+        row2_layout = QHBoxLayout()
+        row2_layout.setSpacing(4)
+        for role_code, label in ROLE_DEFINITIONS:
+            btn = QPushButton(label)
+            btn.setObjectName("laneBtn")
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda _, r=role_code: self.on_secondary_clicked(r))
+            self.secondary_buttons[role_code] = btn
+            row2_layout.addWidget(btn)
+        main_layout.addLayout(row2_layout)
+
+        self.update_ui_state()
+
+    def on_primary_clicked(self, role_code):
         if self.primary_role == role_code:
-            # Shift secondary to primary
-            self.primary_role = self.secondary_role
-            self.secondary_role = ""
-        elif self.secondary_role == role_code:
-            self.secondary_role = ""
-        elif not self.primary_role:
-            self.primary_role = role_code
-        elif not self.secondary_role:
-            self.secondary_role = role_code
+            return
+
+        old_primary = self.primary_role
+        self.primary_role = role_code
+
+        if role_code == "FILL":
+            self.secondary_role = "UNSELECTED"
         else:
-            # Replace secondary
-            self.secondary_role = role_code
+            # Smart swap: if new primary was secondary, swap them
+            if self.secondary_role == role_code:
+                self.secondary_role = old_primary if old_primary != "FILL" else "FILL"
+            elif self.secondary_role == "UNSELECTED":
+                self.secondary_role = "FILL" if role_code != "FILL" else "UTILITY"
 
-        self.update_buttons()
-        self.roles_changed.emit(self.primary_role or "BOTTOM", self.secondary_role or "UTILITY")
+        self.update_ui_state()
+        self.emit_roles()
 
-    def update_buttons(self):
-        for role_code, btn in self.buttons.items():
-            base_name = next(name for code, name in self.ROLES if code == role_code)
-            if role_code == self.primary_role:
-                btn.setProperty("roleState", "primary")
-                btn.setText(f"{base_name} [1]")
-            elif role_code == self.secondary_role:
-                btn.setProperty("roleState", "secondary")
-                btn.setText(f"{base_name} [2]")
-            else:
-                btn.setProperty("roleState", "")
-                btn.setText(base_name)
+    def on_secondary_clicked(self, role_code):
+        if self.primary_role == "FILL":
+            self.primary_role = "MIDDLE"
+
+        if self.secondary_role == role_code:
+            return
+
+        old_secondary = self.secondary_role
+        self.secondary_role = role_code
+
+        # Smart swap: if new secondary was primary, swap them
+        if self.primary_role == role_code:
+            self.primary_role = old_secondary if old_secondary not in ("UNSELECTED", "FILL") else "TOP"
+
+        self.update_ui_state()
+        self.emit_roles()
+
+    def update_ui_state(self):
+        # Update Primary Buttons
+        for code, btn in self.primary_buttons.items():
+            is_active = (code == self.primary_role)
+            btn.setProperty("roleState", "primary" if is_active else "")
             btn.style().unpolish(btn)
             btn.style().polish(btn)
 
+        # Update Secondary Buttons (Disabled if primary is FILL)
+        is_fill_primary = (self.primary_role == "FILL")
+        for code, btn in self.secondary_buttons.items():
+            btn.setEnabled(not is_fill_primary)
+            is_active = (code == self.secondary_role and not is_fill_primary)
+            btn.setProperty("roleState", "secondary" if is_active else "")
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+        if is_fill_primary:
+            self.lbl_sec.setText("İkincil Rol (Devre Dışı - Birincil 'DOLDUR')")
+            self.lbl_sec.setStyleSheet("color: #6A7282; font-size: 11px;")
+        else:
+            self.lbl_sec.setText("İkincil Rol (2. Tercih):")
+            self.lbl_sec.setStyleSheet("color: #9A6EE2; font-weight: bold; font-size: 11px;")
+
     def set_roles(self, primary, secondary):
-        self.primary_role = primary
-        self.secondary_role = secondary
-        self.update_buttons()
+        pr = ROLE_CANONICAL_MAP.get(str(primary).upper(), "BOTTOM")
+        sr = ROLE_CANONICAL_MAP.get(str(secondary).upper(), "UTILITY")
+
+        if pr == sr and pr != "UNSELECTED":
+            sr = "FILL" if pr != "FILL" else "UNSELECTED"
+        if pr == "FILL":
+            sr = "UNSELECTED"
+
+        self.primary_role = pr
+        self.secondary_role = sr
+        self.update_ui_state()
 
     def get_roles(self):
-        return (self.primary_role or "BOTTOM", self.secondary_role or "UTILITY")
+        pr = self.primary_role or "BOTTOM"
+        sr = self.secondary_role or ("UNSELECTED" if pr == "FILL" else "UTILITY")
+        return pr, sr
 
-
-def create_vector_tray_icon() -> QIcon:
-    """Generates a high-contrast procedural 32x32 QIcon for the system tray."""
-    pm = QPixmap(32, 32)
-    pm.fill(Qt.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.Antialiasing)
-    
-    # Background rounded container
-    p.setBrush(QColor("#14161D"))
-    p.setPen(QColor("#0AC8B9"))
-    p.drawRoundedRect(1, 1, 30, 30, 8, 8)
-    
-    # Inner glowing diamond
-    p.setBrush(QColor("#0AC8B9"))
-    p.setPen(Qt.NoPen)
-    path = QPainterPath()
-    path.moveTo(16, 6)
-    path.lineTo(26, 16)
-    path.lineTo(16, 26)
-    path.lineTo(6, 16)
-    path.closeSubpath()
-    p.drawPath(path)
-    
-    # Center white dot
-    p.setBrush(QColor("#FFFFFF"))
-    p.drawEllipse(13, 13, 6, 6)
-    p.end()
-    return QIcon(pm)
+    def emit_roles(self):
+        pr, sr = self.get_roles()
+        self.roles_changed.emit(pr, sr)
 
 
 class MainWindowV2(QMainWindow):
+    ROLE_SUPPORTED_QUEUES = {400, 420, 440, 700}
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("RiftFlow - Pro Paneli")
-        self.resize(1140, 650)
+        self.resize(1180, 720)
+        self.setMinimumSize(1140, 700)
         self.setStyleSheet(MODERN_THEME)
 
         self.config = ConfigManager()
@@ -240,7 +284,6 @@ class MainWindowV2(QMainWindow):
         self._is_loading = True
         try:
             self.init_ui()
-            self.init_tray()
             self.load_config()
         finally:
             self._is_loading = False
@@ -250,50 +293,9 @@ class MainWindowV2(QMainWindow):
         self.lcu_worker.status_changed.connect(self.update_status)
         self.lcu_worker.log_message.connect(self.append_log)
         self.lcu_worker.champ_select_updated.connect(self.update_champ_select_labels)
-        self.lcu_worker.notification.connect(self.on_worker_notification)
+        self.lcu_worker.notification.connect(self.append_log)
         self.lcu_worker.profile_updated.connect(self.update_profile_info)
         self.lcu_worker.start()
-
-    def init_tray(self):
-        """Initializes the System Tray icon and its context menu."""
-        self.tray_icon = QSystemTrayIcon(create_vector_tray_icon(), self)
-        self.tray_icon.setToolTip("RiftFlow - LoL Otomasyonu")
-
-        tray_menu = QMenu()
-        show_action = QAction("RiftFlow'u Göster", self)
-        show_action.triggered.connect(self.restore_from_tray)
-        tray_menu.addAction(show_action)
-
-        settings_action = QAction("Ayarlar", self)
-        settings_action.triggered.connect(lambda: (self.switch_page(3), self.restore_from_tray()))
-        tray_menu.addAction(settings_action)
-
-        tray_menu.addSeparator()
-
-        quit_action = QAction("Çıkış", self)
-        quit_action.triggered.connect(self.quit_application)
-        tray_menu.addAction(quit_action)
-
-        self.tray_icon.setContextMenu(tray_menu)
-        self.tray_icon.activated.connect(self.on_tray_activated)
-        self.tray_icon.show()
-
-    def on_tray_activated(self, reason):
-        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
-            if self.isVisible():
-                self.hide()
-            else:
-                self.restore_from_tray()
-
-    def restore_from_tray(self):
-        self.showNormal()
-        self.activateWindow()
-        self.raise_()
-
-    def on_worker_notification(self, msg):
-        self.append_log(msg)
-        if self.config.get("desktop_notifications", True) and hasattr(self, 'tray_icon'):
-            self.tray_icon.showMessage("RiftFlow", msg, QSystemTrayIcon.Information, 2000)
 
     def append_log(self, text):
         if hasattr(self, 'log_text'):
@@ -348,7 +350,7 @@ class MainWindowV2(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
         
-        # Sidebar
+        # Sidebar (3 tabs: Ana Sayfa, Scriptler, Loglar - Ayarlar removed as requested)
         sidebar = QWidget()
         sidebar.setObjectName("sidebar")
         sidebar.setFixedWidth(180)
@@ -357,7 +359,7 @@ class MainWindowV2(QMainWindow):
         sidebar_layout.setSpacing(6)
         
         self.nav_btns = []
-        nav_items = ["Ana Sayfa", "Scriptler", "Loglar", "Ayarlar"]
+        nav_items = ["Ana Sayfa", "Scriptler", "Loglar"]
         for i, item in enumerate(nav_items):
             btn = QPushButton(item)
             btn.setCheckable(True)
@@ -399,7 +401,7 @@ class MainWindowV2(QMainWindow):
         
         right_layout.addWidget(header)
         
-        # Content - QStackedWidget
+        # Content - QStackedWidget (3 pages)
         self.stacked_widget = QStackedWidget()
         right_layout.addWidget(self.stacked_widget)
         
@@ -418,9 +420,6 @@ class MainWindowV2(QMainWindow):
         
         # Page 2: Loglar
         self.setup_logs_page()
-        
-        # Page 3: Ayarlar
-        self.setup_settings_page()
             
         self.stacked_widget.setCurrentIndex(0)
         main_layout.addWidget(right_widget)
@@ -432,9 +431,10 @@ class MainWindowV2(QMainWindow):
 
     def setup_matchmaking_card(self, parent_layout):
         group = QGroupBox("EŞLEŞTİRME & LOBİ")
-        group.setFixedWidth(440)
+        group.setFixedWidth(450)
         layout = QVBoxLayout(group)
-        layout.setSpacing(12)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(10)
         
         # Game Mode selection & Create Lobby
         mode_header = QLabel("Oyun Modu:")
@@ -465,7 +465,7 @@ class MainWindowV2(QMainWindow):
         self.queue_status.setObjectName("highlightText")
         layout.addWidget(self.queue_status)
         
-        # Auto Accept + Sleek Slider (Auto Queue removed as requested)
+        # Auto Accept + Sleek Slider
         aa_layout = QVBoxLayout()
         aa_header = QHBoxLayout()
         aa_lbl = QLabel("Oto Kabul")
@@ -490,13 +490,9 @@ class MainWindowV2(QMainWindow):
         aa_layout.addLayout(slider_box)
         layout.addLayout(aa_layout)
         
-        # Visual Lane/Role Selector
+        # Dual Row Role Selector (Primary & Secondary separated)
         layout.addSpacing(2)
-        role_title = QLabel("Koridor / Rol Tercihi:")
-        role_title.setStyleSheet("font-weight: bold; color: #FFFFFF;")
-        layout.addWidget(role_title)
-
-        self.role_selector = ModernRoleSelector()
+        self.role_selector = DualRowRoleSelector()
         self.role_selector.roles_changed.connect(self.on_roles_changed)
         layout.addWidget(self.role_selector)
         
@@ -558,13 +554,15 @@ class MainWindowV2(QMainWindow):
 
     def setup_pickban_card(self, parent_layout):
         group = QGroupBox("ŞAMPİYON SEÇİM & BAN")
-        group.setFixedWidth(470)
+        group.setFixedWidth(490)
         layout = QVBoxLayout(group)
-        layout.setSpacing(12)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(6)
         
         layout.addWidget(QLabel("Seçim Tercihi"))
         
         pick_grid = QGridLayout()
+        pick_grid.setSpacing(6)
         self.pick_icons = []
         self.pick_combos = []
         for i, text in enumerate(["1.", "2.", "3."]):
@@ -580,7 +578,7 @@ class MainWindowV2(QMainWindow):
             pick_grid.addWidget(icon, 1, i, alignment=Qt.AlignCenter)
             
             combo = QComboBox()
-            combo.setFixedWidth(115)
+            combo.setFixedWidth(118)
             combo.addItems(self.champ_list)
             combo.currentIndexChanged.connect(lambda idx, c=i: self.update_pick(c))
             self.pick_combos.append(combo)
@@ -589,7 +587,6 @@ class MainWindowV2(QMainWindow):
         ready = QLabel("Hazır", objectName="readyText")
         pick_grid.addWidget(ready, 2, 3)
         layout.addLayout(pick_grid)
-        layout.addSpacing(4)
         
         sw_layout1 = QHBoxLayout()
         sw_layout1.addWidget(QLabel("Oto Şampiyon Seçimi"))
@@ -641,11 +638,10 @@ class MainWindowV2(QMainWindow):
         sw_layout3.addLayout(presets_box)
         
         layout.addLayout(sw_layout3)
-        
-        layout.addSpacing(4)
         layout.addWidget(QLabel("Ban Tercihi:"))
         
         ban_grid = QGridLayout()
+        ban_grid.setSpacing(6)
         self.ban_icons = []
         self.ban_combos = []
         for i in range(3):
@@ -657,7 +653,7 @@ class MainWindowV2(QMainWindow):
             ban_grid.addWidget(icon, 0, i, alignment=Qt.AlignCenter)
             
             combo = QComboBox()
-            combo.setFixedWidth(115)
+            combo.setFixedWidth(118)
             combo.addItems(self.champ_list)
             combo.currentIndexChanged.connect(lambda idx, c=i: self.update_ban(c))
             self.ban_combos.append(combo)
@@ -668,6 +664,8 @@ class MainWindowV2(QMainWindow):
         layout.addLayout(ban_grid)
         
         layout.addStretch()
+        
+        # Status box with Safe Dodge & OP.GG Multi-Search buttons
         status_box = QFrame()
         status_box.setStyleSheet("""
             QFrame {
@@ -677,8 +675,8 @@ class MainWindowV2(QMainWindow):
             }
         """)
         s_layout = QVBoxLayout(status_box)
-        s_layout.setContentsMargins(12, 8, 12, 8)
-        s_layout.setSpacing(6)
+        s_layout.setContentsMargins(10, 6, 10, 6)
+        s_layout.setSpacing(4)
         
         top_status_row = QHBoxLayout()
         self.pb_dot = QLabel("●")
@@ -692,18 +690,71 @@ class MainWindowV2(QMainWindow):
         s_layout.addLayout(top_status_row)
         
         detail_row = QHBoxLayout()
-        self.pb_selected = QLabel("Seçilen: -")
-        self.pb_selected.setStyleSheet("color: #0AC8B9; font-weight: bold; font-size: 12px;")
-        detail_row.addWidget(self.pb_selected)
-        detail_row.addSpacing(20)
+        detail_row.setSpacing(10)
+        self.pb_selected = QLabel("Seçim: -")
+        self.pb_selected.setStyleSheet("color: #0AC8B9; font-weight: bold; font-size: 11px;")
+        detail_row.addWidget(self.pb_selected, 1)
         self.pb_banned = QLabel("Ban: -")
-        self.pb_banned.setStyleSheet("color: #E05656; font-weight: bold; font-size: 12px;")
-        detail_row.addWidget(self.pb_banned)
-        detail_row.addStretch()
+        self.pb_banned.setStyleSheet("color: #E05656; font-weight: bold; font-size: 11px;")
+        detail_row.addWidget(self.pb_banned, 1)
         s_layout.addLayout(detail_row)
+
+        # Action row: Safe Dodge & OP.GG Multi-search
+        action_row = QHBoxLayout()
+        self.btn_dodge = QPushButton("Lobiyi Güvenle Boz (Dodge)", objectName="dodgeBtn")
+        self.btn_dodge.setCursor(Qt.PointingHandCursor)
+        self.btn_dodge.clicked.connect(self.on_safe_dodge_clicked)
+        action_row.addWidget(self.btn_dodge)
+
+        self.btn_opgg = QPushButton("Takımı OP.GG'de Gör", objectName="opggBtn")
+        self.btn_opgg.setCursor(Qt.PointingHandCursor)
+        self.btn_opgg.clicked.connect(self.open_opgg_multi_search)
+        action_row.addWidget(self.btn_opgg)
+        s_layout.addLayout(action_row)
         
         layout.addWidget(status_box)
         parent_layout.addWidget(group)
+
+    def on_safe_dodge_clicked(self):
+        if self.lcu_client.force_dodge():
+            self.append_log("Lobiden güvenle çıkıldı / şampiyon seçimi bozuldu (Dodge).")
+        else:
+            self.append_log("Dodge isteği başarısız oldu (Şu an şampiyon seçiminde olmayabilirsiniz).")
+
+    def open_opgg_multi_search(self):
+        try:
+            names = []
+            session = self.lcu_client.get_champ_select_session()
+            if session and isinstance(session, dict):
+                for p in session.get("myTeam", []):
+                    puuid = p.get("puuid")
+                    if puuid:
+                        try:
+                            s = self.lcu_client.request("GET", f"/lol-summoner/v2/summoners/puuid/{puuid}")
+                            if isinstance(s, dict):
+                                gname = s.get("gameName")
+                                tag = s.get("tagLine", "TR1")
+                                if gname:
+                                    names.append(f"{gname}%23{tag}")
+                        except Exception:
+                            pass
+            
+            if not names:
+                lobby = self.lcu_client.get_lobby_info()
+                if lobby and isinstance(lobby, dict):
+                    for m in lobby.get("members", []):
+                        m_name = m.get("summonerName")
+                        if m_name:
+                            names.append(m_name)
+
+            if names:
+                url = f"https://www.op.gg/multisearch/tr?summoners={','.join(names)}"
+                webbrowser.open(url)
+                self.append_log(f"OP.GG Çoklu Arama açıldı: {len(names)} oyuncu bulundu.")
+            else:
+                self.append_log("OP.GG için takım oyuncuları henüz tespit edilemedi (Lobi veya Şampiyon Seçimi bekleniyor).")
+        except Exception as e:
+            self.append_log(f"OP.GG arama hatası: {e}")
 
     def setup_scripts_page(self):
         page = QWidget()
@@ -716,19 +767,16 @@ class MainWindowV2(QMainWindow):
         layout.setContentsMargins(25, 20, 25, 20)
         layout.setSpacing(15)
         
-        group1 = QGroupBox("YENİLİKÇİ MAÇ ÖNCESİ & LOBİ OTOMASYONLARI")
+        group1 = QGroupBox("YENİLİKÇİ VE GEREKLİ OTOMASYONLAR")
         g1_layout = QVBoxLayout(group1)
         g1_layout.setSpacing(12)
         
         modules = [
-            ("ARAM Yedek Kulübesi Kapıcı (Auto Bench Sniper)", "ARAM'da takım arkadaşları zar attığında istediğin şampiyon kulübeye düşerse anında kapar.", "auto_bench_sniper"),
-            ("Otomatik Arkadaş Daveti Kabulü (Auto Invite Accept)", "Arkadaşların seni bir lobiye davet ettiğinde beklemeden otomatik katılır.", "auto_accept_invites"),
             ("Otomatik Meta Rün İçe Aktarma (Auto Runes)", "Şampiyon kilitlendiği an resmi Riot API'sinden en yüksek kazanma oranlı meta rün sayfasını uygular.", "auto_recommended_runes"),
-            ("ARAM Otomatik Zar Atma (Auto-Reroll)", "ARAM lobisine girildiğinde varsa otomatik 1 adet yeniden zar atar.", "auto_reroll_aram"),
-            ("Otomatik Rol / Sıra Takas Kabulü (Auto Swap Accept)", "Şampiyon seçiminde rol veya sıra takas isteklerini otomatik onaylar.", "auto_swap_accept"),
-            ("Otomatik Tekrar Oyna (Auto Play Again)", "Maç bittiğinde ve istatistik ekranı geldiğinde otomatik lobiyi yeniden kurar.", "auto_play_again"),
-            ("Otomatik 'Hazırım' Onayı (Auto Party Ready)", "Lobi başkanı oyunu başlattığında takımdaki yerini otomatik hazıra çeker.", "auto_party_ready"),
-            ("İstemci Düşük Donanım Modu (FPS Boost)", "Oyun içindeyken LoL istemcisini uyutarak maksimum FPS ve sıfır RAM kullanımı sağlar.", "auto_low_spec"),
+            ("Akıllı Çarp & Büyü Koruyucusu (Smart Spells / Auto Smite)", "Ormancı geldiğinde otomatik Çarp+Sıçra, diğer rollere uygun meta sihirdar büyülerini atar.", "auto_smart_spells"),
+            ("Otomatik Arkadaş Daveti Kabulü (Auto Invite Accept)", "Arkadaşların seni bir lobiye davet ettiğinde beklemeden otomatik katılır.", "auto_accept_invites"),
+            ("Gizli Mod / Çevrimdışı Görünme (Appear Offline)", "LoL istemcisinde maç atarken arkadaş listesinde görünmez (offline) kalmanı sağlar.", "auto_appear_offline"),
+            ("İstemci Düşük Donanım Modu (FPS Boost)", "Oyun içindeyken LoL istemcisini uyutarak maksimum FPS ve sıfır RAM kullanımı sağlar.", "auto_low_spec")
         ]
         
         self.script_switches = {}
@@ -742,7 +790,7 @@ class MainWindowV2(QMainWindow):
             row.addLayout(lbl_box)
             
             sw = ModernSwitch()
-            sw.setChecked(self.config.get(key, False))
+            sw.setChecked(self.config.get(key, True if key in ("auto_recommended_runes", "auto_smart_spells") else False))
             sw.toggled.connect(lambda val, k=key: self.on_script_toggled(k, val))
             self.script_switches[key] = sw
             row.addWidget(sw)
@@ -753,7 +801,7 @@ class MainWindowV2(QMainWindow):
         group2 = QGroupBox("HIZLI LOBİ EYLEMLERİ")
         g2_layout = QHBoxLayout(group2)
         btn_fix_lobby = QPushButton("Lobiyi Yenile / Sıfırla")
-        btn_fix_lobby.clicked.connect(lambda: self.on_mode_button_clicked('Ranked Solo/Duo', 420))
+        btn_fix_lobby.clicked.connect(lambda: self.on_mode_button_clicked('Dereceli Tek/Çift (Solo/Duo)', 420))
         
         btn_leave_lobby = QPushButton("Lobiden Tamamen Ayrıl")
         btn_leave_lobby.clicked.connect(self.leave_lobby_action)
@@ -808,119 +856,6 @@ class MainWindowV2(QMainWindow):
         
         self.stacked_widget.addWidget(page)
 
-    def setup_settings_page(self):
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(30, 20, 30, 20)
-        layout.setSpacing(20)
-        
-        group = QGroupBox("İSTEMCİ, BİLDİRİM & SİSTEM AYARLARI")
-        g_layout = QVBoxLayout(group)
-        g_layout.setSpacing(16)
-        
-        lbl_dir = QLabel(f"Tespit Edilen LoL İstemcisi: Aktif (Auto-Discovery)")
-        lbl_dir.setStyleSheet("color: #0AC8B9; font-weight: bold; font-size: 13px;")
-        g_layout.addWidget(lbl_dir)
-        
-        # Match found sound chime
-        r1 = QHBoxLayout()
-        lbl_sound = QVBoxLayout()
-        lbl_sound.addWidget(QLabel("Maç Bulunduğunda Ses Çal:"))
-        sub_sound = QLabel("Eşleşme bulunduğunda dikkat çekici bir melodik Hextech sesi çalar.")
-        sub_sound.setStyleSheet("color: #6C7A89; font-size: 11px;")
-        lbl_sound.addWidget(sub_sound)
-        r1.addLayout(lbl_sound)
-        r1.addStretch()
-        
-        self.btn_test_sound = QPushButton("Sesi Test Et", objectName="testSoundBtn")
-        self.btn_test_sound.setFixedWidth(110)
-        self.btn_test_sound.setCursor(Qt.PointingHandCursor)
-        self.btn_test_sound.clicked.connect(test_sound)
-        r1.addWidget(self.btn_test_sound)
-        r1.addSpacing(10)
-        
-        self.sw_sound = ModernSwitch()
-        self.sw_sound.setChecked(self.config.get("play_sound_on_ready", True))
-        self.sw_sound.toggled.connect(lambda val: (self.config.set("play_sound_on_ready", val), self.config.save()))
-        r1.addWidget(self.sw_sound)
-        g_layout.addLayout(r1)
-
-        # Minimize to tray on close
-        r2 = QHBoxLayout()
-        lbl_tray = QVBoxLayout()
-        lbl_tray.addWidget(QLabel("Kapatıldığında Sistem Tepsisine Küçült:"))
-        sub_tray = QLabel("Pencereyi kapattığında program arka planda çalışmaya devam eder.")
-        sub_tray.setStyleSheet("color: #6C7A89; font-size: 11px;")
-        lbl_tray.addWidget(sub_tray)
-        r2.addLayout(lbl_tray)
-        r2.addStretch()
-        
-        self.sw_tray = ModernSwitch()
-        self.sw_tray.setChecked(self.config.get("minimize_to_tray", True))
-        self.sw_tray.toggled.connect(lambda val: (self.config.set("minimize_to_tray", val), self.config.save()))
-        r2.addWidget(self.sw_tray)
-        g_layout.addLayout(r2)
-
-        # Start with Windows
-        r3 = QHBoxLayout()
-        lbl_boot = QVBoxLayout()
-        lbl_boot.addWidget(QLabel("Windows ile Birlikte Başlat:"))
-        sub_boot = QLabel("Bilgisayar açıldığında RiftFlow otomatik olarak sistem tepsisinde başlar.")
-        sub_boot.setStyleSheet("color: #6C7A89; font-size: 11px;")
-        lbl_boot.addWidget(sub_boot)
-        r3.addLayout(lbl_boot)
-        r3.addStretch()
-        
-        self.sw_startup = ModernSwitch()
-        self.sw_startup.setChecked(self.config.get("start_with_windows", False))
-        self.sw_startup.toggled.connect(self.on_startup_toggled)
-        r3.addWidget(self.sw_startup)
-        g_layout.addLayout(r3)
-
-        # Desktop notifications
-        r4 = QHBoxLayout()
-        lbl_notif = QVBoxLayout()
-        lbl_notif.addWidget(QLabel("Windows Masaüstü Bildirimleri:"))
-        sub_notif = QLabel("Maç kabul edildiğinde veya şampiyon kilitlendiğinde masaüstü balonu gösterir.")
-        sub_notif.setStyleSheet("color: #6C7A89; font-size: 11px;")
-        lbl_notif.addWidget(sub_notif)
-        r4.addLayout(lbl_notif)
-        r4.addStretch()
-        
-        self.sw_notif = ModernSwitch()
-        self.sw_notif.setChecked(self.config.get("desktop_notifications", True))
-        self.sw_notif.toggled.connect(lambda val: (self.config.set("desktop_notifications", val), self.config.save()))
-        r4.addWidget(self.sw_notif)
-        g_layout.addLayout(r4)
-
-        layout.addWidget(group)
-        layout.addStretch()
-        self.stacked_widget.addWidget(page)
-
-    def on_startup_toggled(self, val):
-        self.config.set("start_with_windows", val)
-        self.config.save()
-        try:
-            key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-            app_name = "RiftFlow"
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
-            if val:
-                if getattr(sys, 'frozen', False):
-                    exe_path = sys.executable
-                else:
-                    exe_path = os.path.abspath(sys.argv[0])
-                winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, f'"{exe_path}"')
-                self.append_log("RiftFlow başlangıç kayıt defterine eklendi.")
-            else:
-                try:
-                    winreg.DeleteValue(key, app_name)
-                    self.append_log("RiftFlow başlangıç kayıt defterinden kaldırıldı.")
-                except FileNotFoundError:
-                    pass
-            winreg.CloseKey(key)
-        except Exception as e:
-            logger.error(f"Failed to update startup registry: {e}")
-
     def update_pick(self, idx):
         champ = self.pick_combos[idx].currentText()
         pm = self.get_champion_pixmap(champ)
@@ -963,7 +898,7 @@ class MainWindowV2(QMainWindow):
         self.chat_msg_input.setText(self.config.get('chat_message', 'mid'))
         self.chat_repeat_spin.setValue(self.config.get('chat_repeat_count', 1))
         
-        # Load roles
+        # Load roles canonically
         pr = self.config.get('role_primary', 'BOTTOM')
         sr = self.config.get('role_secondary', 'UTILITY')
         self.role_selector.set_roles(pr, sr)
@@ -980,7 +915,7 @@ class MainWindowV2(QMainWindow):
             self.update_ban(i-1)
             
         for k, sw in getattr(self, 'script_switches', {}).items():
-            sw.setChecked(self.config.get(k, False))
+            sw.setChecked(self.config.get(k, True if k in ("auto_recommended_runes", "auto_smart_spells") else False))
 
         # Connect signals for auto saving
         self.auto_accept_sw.toggled.connect(lambda _: self.save_config())
@@ -999,7 +934,7 @@ class MainWindowV2(QMainWindow):
                 self.lcu_client.request("DELETE", "/lol-lobby/v2/lobby")
                 time.sleep(0.2)
             self.lcu_client.create_lobby(queue_id)
-            time.sleep(0.2)
+            time.sleep(0.25)
             self.apply_roles_if_in_lobby()
             self.queue_status.setText(f"Sıra Durumu: [Lobi Kuruldu - {mode_name}]")
             self.append_log(f"Oyun Modu değiştirildi: {mode_name} (Lobi Kuruldu)")
@@ -1007,12 +942,23 @@ class MainWindowV2(QMainWindow):
             pass
 
     def apply_roles_if_in_lobby(self):
-        primary, secondary = self.role_selector.get_roles()
+        """Only apply position preferences if currently in a draft/ranked queue."""
         try:
+            lobby_info = self.lcu_client.get_lobby_info()
+            if not lobby_info or not isinstance(lobby_info, dict):
+                return False
+
+            queue_id = lobby_info.get("gameConfig", {}).get("queueId")
+            if queue_id not in self.ROLE_SUPPORTED_QUEUES:
+                return False
+
+            primary, secondary = self.role_selector.get_roles()
             if self.lcu_client.set_roles(primary, secondary):
-                self.append_log(f"Lobi Rolleri Ayarlandı: 1 -> {primary}, 2 -> {secondary}")
-        except Exception:
-            pass
+                self.append_log(f"Lobi Rolleri Güncellendi: 1. -> {primary}, 2. -> {secondary}")
+                return True
+        except Exception as e:
+            logger.debug(f"apply_roles_if_in_lobby error: {e}")
+        return False
 
     def save_config(self):
         if getattr(self, '_is_loading', False):
@@ -1095,19 +1041,19 @@ class MainWindowV2(QMainWindow):
     def update_champ_select_labels(self, picked, banned):
         if hasattr(self, 'pb_selected'):
             if picked and picked.strip() and picked not in ("Yok", "-", "None", ""):
-                self.pb_selected.setText(f"Seçilen: {picked}")
-                self.pb_selected.setStyleSheet("color: #26B47C; font-weight: bold; font-size: 12px;")
+                self.pb_selected.setText(f"Seçim: {picked}")
+                self.pb_selected.setStyleSheet("color: #26B47C; font-weight: bold; font-size: 11px;")
             else:
-                self.pb_selected.setText("Seçilen: Bekleniyor...")
-                self.pb_selected.setStyleSheet("color: #0AC8B9; font-weight: bold; font-size: 12px;")
+                self.pb_selected.setText("Seçim: Bekleniyor")
+                self.pb_selected.setStyleSheet("color: #0AC8B9; font-weight: bold; font-size: 11px;")
 
         if hasattr(self, 'pb_banned'):
             if banned and banned.strip() and banned not in ("Yok", "-", "None", ""):
                 self.pb_banned.setText(f"Ban: {banned}")
-                self.pb_banned.setStyleSheet("color: #E05656; font-weight: bold; font-size: 12px;")
+                self.pb_banned.setStyleSheet("color: #E05656; font-weight: bold; font-size: 11px;")
             else:
-                self.pb_banned.setText("Ban: Bekleniyor...")
-                self.pb_banned.setStyleSheet("color: #A0B0C0; font-weight: bold; font-size: 12px;")
+                self.pb_banned.setText("Ban: Bekleniyor")
+                self.pb_banned.setStyleSheet("color: #A0B0C0; font-weight: bold; font-size: 11px;")
 
     def update_gameflow(self, phase):
         phase_map = {
@@ -1142,18 +1088,18 @@ class MainWindowV2(QMainWindow):
 
         if phase == "ChampSelect":
             if hasattr(self, 'pb_selected') and self.pb_selected.text().endswith("-"):
-                self.pb_selected.setText("Seçilen: Bekleniyor...")
+                self.pb_selected.setText("Seçim: Bekleniyor")
             if hasattr(self, 'pb_banned') and self.pb_banned.text().endswith("-"):
-                self.pb_banned.setText("Ban: Bekleniyor...")
+                self.pb_banned.setText("Ban: Bekleniyor")
         elif phase == "InProgress":
             pass
         elif phase in ("Lobby", "None", "Matchmaking"):
             if hasattr(self, 'pb_selected'): 
-                self.pb_selected.setText("Seçilen: -")
-                self.pb_selected.setStyleSheet("color: #A0B0C0; font-weight: bold; font-size: 12px;")
+                self.pb_selected.setText("Seçim: -")
+                self.pb_selected.setStyleSheet("color: #A0B0C0; font-weight: bold; font-size: 11px;")
             if hasattr(self, 'pb_banned'): 
                 self.pb_banned.setText("Ban: -")
-                self.pb_banned.setStyleSheet("color: #A0B0C0; font-weight: bold; font-size: 12px;")
+                self.pb_banned.setStyleSheet("color: #A0B0C0; font-weight: bold; font-size: 11px;")
 
         if phase in ("Lobby", "Matchmaking"):
             try:
@@ -1169,24 +1115,11 @@ class MainWindowV2(QMainWindow):
                 self.lobby_count.setText("Lobideki Oyuncular: 0")
 
     def closeEvent(self, event):
-        if self.config.get("minimize_to_tray", True):
-            event.ignore()
-            self.hide()
-            if self.config.get("desktop_notifications", True) and hasattr(self, 'tray_icon'):
-                self.tray_icon.showMessage("RiftFlow", "RiftFlow arka planda ve sistem tepsisinde çalışmaya devam ediyor.", QSystemTrayIcon.Information, 1800)
-        else:
-            self.quit_application()
-
-    def quit_application(self):
-        try:
-            if hasattr(self, 'tray_icon'):
-                self.tray_icon.hide()
-        except Exception:
-            pass
+        """Standard window close exits cleanly without tray persistence."""
         self.lcu_worker.stop()
         self.lcu_worker.wait()
         try:
             self.lcu_client.close()
         except Exception:
             pass
-        QApplication.quit()
+        event.accept()

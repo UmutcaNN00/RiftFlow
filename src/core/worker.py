@@ -3,7 +3,6 @@ import logging
 from PySide6.QtCore import QThread, Signal
 from .lcu_client import LcuClient
 from .config import ConfigManager
-from .sound_alert import play_match_found_sound
 
 logger = logging.getLogger(__name__)
 
@@ -27,17 +26,15 @@ class LcuWorker(QThread):
         self.last_phase = None
         self.last_connected = None
         self._chat_sent_for_session = False
-        self._aram_rerolled = False
         self._runes_applied_for_session = False
+        self._spells_applied_for_session = False
         self._last_selected_champ = ""
         self._last_banned_champ = ""
-        self._play_again_done = False
         self._low_spec_minimized = False
-        self._last_swap_check = 0
         self._last_invite_check = 0
-        self._last_sound_time = 0
+        self._last_presence_check = 0
         self._last_profile_fetch = 0
-        self._accepted_swap_ids = set()
+        self._offline_applied = False
         self._accepted_invite_ids = set()
         self._last_lock_attempts = {}    # action_id -> timestamp (kilit deneme zamanı)
         self._action_retry_counts = {}   # action_id -> retry count (max retry denetimi)
@@ -88,18 +85,15 @@ class LcuWorker(QThread):
                     self.last_phase = clean_phase
                     if clean_phase != "ChampSelect":
                         self._chat_sent_for_session = False
-                        self._aram_rerolled = False
                         self._runes_applied_for_session = False
-                        self._accepted_swap_ids.clear()
+                        self._spells_applied_for_session = False
                         self._last_lock_attempts.clear()
                         self._action_retry_counts.clear()
                     if clean_phase in ("Lobby", "None", "Matchmaking"):
                         self._last_selected_champ = ""
                         self._last_banned_champ = ""
-                        self._play_again_done = False
                         self.champ_select_updated.emit("", "")
                     elif clean_phase == "InProgress":
-                        self._play_again_done = False
                         if self._last_selected_champ:
                             self.champ_select_updated.emit(self._last_selected_champ, self._last_banned_champ)
 
@@ -110,11 +104,11 @@ class LcuWorker(QThread):
                 elif clean_phase in ("Lobby", "None"):
                     if self.config.get("auto_accept_invites", False):
                         self.handle_incoming_invites()
+                    if self.config.get("auto_appear_offline", False):
+                        self.handle_appear_offline()
                     if clean_phase == "Lobby":
                         if self.config.get("auto_queue", False):
                             self.lcu.start_matchmaking()
-                        if self.config.get("auto_party_ready", False):
-                            self.handle_party_ready()
                         if self._low_spec_minimized:
                             try:
                                 self.lcu.request("POST", "/riotclient/ux-show")
@@ -136,8 +130,6 @@ class LcuWorker(QThread):
                         except Exception:
                             pass
                         self._low_spec_minimized = False
-                    if self.config.get("auto_play_again", False) and not self._play_again_done:
-                        self.handle_play_again()
 
         except Exception as e:
             logger.error(f"Error in poll_cycle: {e}")
@@ -145,15 +137,10 @@ class LcuWorker(QThread):
             self._is_polling = False
 
     def handle_ready_check(self):
-        current_time = time.time()
-        if self.config.get("play_sound_on_ready", True):
-            if current_time - self._last_sound_time > 5.0:
-                self._last_sound_time = current_time
-                play_match_found_sound()
-
         if not self.config.get("auto_accept", False):
             return
             
+        current_time = time.time()
         if current_time - self.last_accept_time > 4.0:
             delay = self.config.get("accept_delay", 0)
             if delay > 0:
@@ -186,26 +173,11 @@ class LcuWorker(QThread):
         if not session or not isinstance(session, dict):
             return
 
-        # ARAM Auto Reroll
-        if self.config.get("auto_reroll_aram", False) and not self._aram_rerolled:
-            is_aram = session.get("benchEnabled", False) or session.get("hasInterest", False)
-            if is_aram and session.get("rerollsRemaining", 0) > 0:
-                try:
-                    self.lcu.request("POST", "/lol-champ-select/v1/session/my-selection/reroll")
-                    self._aram_rerolled = True
-                    self.log("ARAM otomatik zar atıldı!")
-                except Exception as e:
-                    logger.debug(f"ARAM reroll failed: {e}")
-
-        # Auto Swap Accept (Role / Pick Order / Champion Trade)
-        if self.config.get("auto_swap_accept", False):
-            self.handle_swap_accept()
-
         local_player_cell_id = session.get("localPlayerCellId")
 
-        # ARAM Auto Bench Sniper
-        if self.config.get("auto_bench_sniper", False):
-            self.handle_bench_sniper(session, local_player_cell_id)
+        # Auto Smart Spells (Auto Smite for Jungle, Flash + TP/Ignite)
+        if self.config.get("auto_smart_spells", True) and not self._spells_applied_for_session:
+            self.handle_smart_spells(session, local_player_cell_id)
 
         # Auto Recommended Runes
         if self.config.get("auto_recommended_runes", False) and not self._runes_applied_for_session:
@@ -365,116 +337,52 @@ class LcuWorker(QThread):
         else:
             self.log(f"Ban kilitleme başarısız: {target_name}, 1.2 sn sonra tekrar denenecek.")
 
-    def handle_party_ready(self):
-        try:
-            self.lcu.request("PUT", "/lol-lobby/v1/parties/ready", json={})
-        except Exception:
-            pass
-
-    def handle_play_again(self):
-        try:
-            try:
-                self.lcu.request("POST", "/lol-end-of-game/v1/state/dismiss-stats")
-            except Exception:
-                pass
-            self.msleep(400)
-            self.lcu.request("POST", "/lol-lobby/v2/play-again")
-            self._play_again_done = True
-            self.log("Maç bitti: Otomatik lobiye dönüldü (Play Again).")
-        except Exception:
-            pass
-
-        # Auto Honor Ally
-        try:
-            ballot = self.lcu.request("GET", "/lol-honor-v2/v1/ballot")
-            if ballot and isinstance(ballot, dict):
-                allies = ballot.get("eligibleAllies", [])
-                game_id = ballot.get("gameId")
-                if allies and game_id:
-                    target_id = allies[0].get("summonerId") or allies[0].get("puuid")
-                    if target_id:
-                        self.lcu.request("POST", "/lol-honor-v2/v1/honor-player", json={
-                            "gameId": game_id,
-                            "honorCategory": "HEART",
-                            "summonerId": target_id
-                        })
-                        self.log("Maç sonu: Takım arkadaşına otomatik 'GG / Harika Takım Oyuncusu' onuru verildi!")
-        except Exception:
-            pass
-
-    def handle_swap_accept(self):
-        now = time.time()
-        if now - self._last_swap_check < 1.0:
-            return
-        self._last_swap_check = now
-        
-        # Position / Lane / Role swap accept (Only incoming requests where state == 'RECEIVED')
-        try:
-            p_swaps = self.lcu.request("GET", "/lol-champ-select/v1/session/position-swaps")
-            if isinstance(p_swaps, list):
-                for s in p_swaps:
-                    sid = s.get("id")
-                    state = str(s.get("state", "")).upper()
-                    if sid and state == "RECEIVED" and sid not in self._accepted_swap_ids:
-                        self.lcu.request("POST", f"/lol-champ-select/v1/session/position-swaps/{sid}/accept")
-                        self._accepted_swap_ids.add(sid)
-                        self.log(f"Gelen rol/koridor takas isteği kabul edildi! (ID: {sid})")
-        except Exception:
-            pass
-
-        # Pick order swap accept (Only incoming requests where state == 'RECEIVED')
-        try:
-            po_swaps = self.lcu.request("GET", "/lol-champ-select/v1/session/pick-order-swaps")
-            if isinstance(po_swaps, list):
-                for s in po_swaps:
-                    sid = s.get("id")
-                    state = str(s.get("state", "")).upper()
-                    if sid and state == "RECEIVED" and sid not in self._accepted_swap_ids:
-                        self.lcu.request("POST", f"/lol-champ-select/v1/session/pick-order-swaps/{sid}/accept")
-                        self._accepted_swap_ids.add(sid)
-                        self.log(f"Gelen seçim sırası takas isteği kabul edildi! (ID: {sid})")
-        except Exception:
-            pass
-
-        # Champion trade accept (Only incoming trades where state == 'RECEIVED')
-        try:
-            c_swaps = self.lcu.request("GET", "/lol-champ-select/v1/session/swaps")
-            if isinstance(c_swaps, list):
-                for s in c_swaps:
-                    sid = s.get("id")
-                    state = str(s.get("state", "")).upper()
-                    if sid and state == "RECEIVED" and sid not in self._accepted_swap_ids:
-                        self.lcu.request("POST", f"/lol-champ-select/v1/session/swaps/{sid}/accept")
-                        self._accepted_swap_ids.add(sid)
-                        self.log(f"Gelen şampiyon takas isteği kabul edildi! (ID: {sid})")
-        except Exception:
-            pass
-
-    def handle_bench_sniper(self, session, local_player_cell_id):
-        bench = session.get("benchChampions", [])
-        if not bench:
-            return
-        bench_ids = [b.get("championId") for b in bench if b.get("championId")]
-        if not bench_ids:
-            return
-
-        my_cur_id = 0
+    def handle_smart_spells(self, session, local_player_cell_id):
+        # 4: Flash, 11: Smite, 14: Ignite, 12: Teleport, 7: Heal, 3: Exhaust, 6: Ghost
+        pos = ""
         for p in session.get("myTeam", []):
             if p.get("cellId") == local_player_cell_id:
-                my_cur_id = p.get("championId") or 0
+                pos = str(p.get("assignedPosition") or "").lower()
                 break
 
-        # Preferences in priority order 1, 2, 3
-        for pref_key in ("pick_preference_1", "pick_preference_2", "pick_preference_3"):
-            cname = self.config.get(pref_key)
-            if not cname or cname in ("None", ""):
-                continue
-            tid = self.ddragon.get_champion_id(cname)
-            if tid and tid in bench_ids and tid != my_cur_id:
-                if self.lcu.swap_bench_champion(tid):
-                    champ_display = self.ddragon.get_champion_name(tid)
-                    self.log(f"ARAM Bench Sniper: {champ_display} kulübeden anında kapıldı!")
-                    break
+        if not pos:
+            return
+
+        spell1, spell2 = 4, 14
+        if pos == "jungle":
+            spell1, spell2 = 4, 11 # Flash + Smite
+            pos_label = "Orman (Çarp + Sıçra)"
+        elif pos == "top":
+            spell1, spell2 = 4, 12 # Flash + Teleport
+            pos_label = "Üst Koridor (Işınlan + Sıçra)"
+        elif pos == "middle":
+            spell1, spell2 = 4, 14 # Flash + Tutuştur
+            pos_label = "Orta Koridor (Tutuştur + Sıçra)"
+        elif pos == "bottom":
+            spell1, spell2 = 4, 7  # Flash + Şifa
+            pos_label = "Alt Koridor (Şifa + Sıçra)"
+        elif pos == "utility":
+            spell1, spell2 = 4, 14 # Flash + Tutuştur
+            pos_label = "Destek (Tutuştur + Sıçra)"
+        else:
+            return
+
+        if self.lcu.set_summoner_spells(spell1, spell2):
+            self._spells_applied_for_session = True
+            self.log(f"Akıllı Büyü: {pos_label} büyüleri otomatik atandı!")
+
+    def handle_appear_offline(self):
+        now = time.time()
+        if now - self._last_presence_check < 15.0:
+            return
+        self._last_presence_check = now
+        try:
+            if self.lcu.set_chat_availability("offline"):
+                if not self._offline_applied:
+                    self.log("Gizli Mod: Sohbet durumu başarıyla 'Çevrimdışı (offline)' yapıldı.")
+                self._offline_applied = True
+        except Exception:
+            pass
 
     def handle_auto_runes(self, session, local_player_cell_id):
         locked_cid = 0

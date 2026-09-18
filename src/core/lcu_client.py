@@ -214,12 +214,72 @@ class LcuClient:
             return False
 
     def set_roles(self, first_pref, second_pref):
-        payload = {"firstPreference": first_pref, "secondPreference": second_pref}
+        """Sets position preferences on the local lobby member with canonical enum validation."""
+        role_map = {
+            "TOP": "TOP", "JUNGLE": "JUNGLE", "JGL": "JUNGLE",
+            "MIDDLE": "MIDDLE", "MID": "MIDDLE", "BOTTOM": "BOTTOM",
+            "ADC": "BOTTOM", "BOT": "BOTTOM", "UTILITY": "UTILITY",
+            "SUP": "UTILITY", "SUPPORT": "UTILITY", "FILL": "FILL",
+            "UNSELECTED": "UNSELECTED"
+        }
+        c_first = role_map.get(str(first_pref).upper(), "BOTTOM")
+        c_second = role_map.get(str(second_pref).upper(), "UTILITY")
+
+        # Duplicate check to prevent LCU 400 error
+        if c_first == c_second:
+            c_second = "UNSELECTED" if c_first == "FILL" else "FILL"
+
+        if c_first == "FILL":
+            c_second = "UNSELECTED"
+
+        payload = {
+            "firstPreference": c_first,
+            "secondPreference": c_second
+        }
+
         try:
             self.request("PUT", "/lol-lobby/v2/lobby/members/localMember/position-preferences", json=payload)
+            logger.info(f"Position preferences set: {c_first} / {c_second}")
             return True
         except Exception as e:
-            logger.error(f"Set roles error: {e}")
+            logger.error(f"Set roles error (payload: {payload}): {e}")
+            return False
+
+    def set_summoner_spells(self, spell1_id, spell2_id):
+        try:
+            self.request("PATCH", "/lol-champ-select/v1/session/my-selection", json={
+                "spell1Id": int(spell1_id),
+                "spell2Id": int(spell2_id)
+            })
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to set summoner spells: {e}")
+            return False
+
+    def force_dodge(self):
+        """Safely dodges champion select without exiting the League client."""
+        try:
+            self.request("POST", "/lol-gameflow/v1/session/dodge")
+            return True
+        except Exception:
+            try:
+                self.request("POST", "/lol-login/v1/session/invoke", json={
+                    "destination": "lcdsServiceProxy",
+                    "method": "call",
+                    "args": "[\"\", \"teambuilder-draft\", \"quitV2\", \"\"]"
+                })
+                return True
+            except Exception as e:
+                logger.error(f"Force dodge error: {e}")
+                return False
+
+    def set_chat_availability(self, status="offline"):
+        """Changes player availability status in LoL chat (e.g. offline, chat, dnd)."""
+        try:
+            self.request("PUT", "/lol-chat/v1/me", json={"availability": str(status)})
+            return True
+        except Exception as e:
+            logger.debug(f"Set chat availability error: {e}")
             return False
 
     def send_champ_select_chat(self, message, repeat_count=1):

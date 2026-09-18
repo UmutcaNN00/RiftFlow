@@ -286,4 +286,30 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
     color: #17181D;
     border-color: #0AC8B9;
 }
+#dodgeBtn {
+    background-color: #381A22;
+    border: 1px solid #6E2231;
+    color: #FF5E7E;
+    font-weight: bold;
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-size: 11px;
+}
+#dodgeBtn:hover {
+    background-color: #4D212E;
+    border-color: #FF5E7E;
+}
+#opggBtn {
+    background-color: #1A2638;
+    border: 1px solid #23456E;
+    color: #5383E8;
+    font-weight: bold;
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-size: 11px;
+}
+#opggBtn:hover {
+    background-color: #21334D;
+    border-color: #5383E8;
+}
 """
