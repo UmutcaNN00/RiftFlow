@@ -237,7 +237,15 @@ class LcuWorker(QThread):
                 if action.get("completed") and action.get("championId"):
                     unselectable.add(action.get("championId"))
 
-        phase = session.get("timer", {}).get("phase", "")
+        # Banlanamaz şampiyonlar: unselectable + takım arkadaşlarının önseçimleri (Riot Ban Prevention)
+        unbanable = set(unselectable)
+        for p in session.get("myTeam", []):
+            if p.get("cellId") != local_player_cell_id:
+                intent_id = p.get("championPickIntent")
+                if intent_id and intent_id > 0:
+                    unbanable.add(intent_id)
+
+        phase = str(session.get("timer", {}).get("phase", "")).upper()
         for action_group in actions:
             for action in action_group:
                 if action.get("actorCellId") == local_player_cell_id and not action.get("completed"):
@@ -248,23 +256,15 @@ class LcuWorker(QThread):
                     if action_type == "pick":
                         self.handle_pick_action(action_id, action, unselectable, is_in_progress, phase)
                     elif action_type == "ban":
-                        self.handle_ban_action(action_id, action, unselectable, is_in_progress, phase)
+                        self.handle_ban_action(action_id, action, unbanable, is_in_progress, phase)
 
     def handle_pick_action(self, action_id, action, unselectable, is_in_progress, phase=""):
         if not self.config.get("auto_pick", True):
             return
 
-        retries = self._action_retry_counts.get(action_id, 0)
-        # Dynamic fallback: if priority 1 fails repeatedly (e.g. taken/disabled), try priority 2, then 3
-        pref_start = 1
-        if retries >= 4:
-            pref_start = 2
-        if retries >= 8:
-            pref_start = 3
-
         target_champ = None
         target_name = None
-        for i in range(pref_start, 4):
+        for i in range(1, 4):
             champ_name = self.config.get(f"pick_preference_{i}")
             if not champ_name or champ_name == "None": continue
             champ_id = self.ddragon.get_champion_id(champ_name)
@@ -284,12 +284,16 @@ class LcuWorker(QThread):
                 self.lcu.hover_champion(action_id, target_champ)
             return
 
-        # 2. Seçim sırası bizde (isInProgress == True)! Sürekli ve kararlı kilitleme denetimi
+        # 2. Seçim sırası bizde (isInProgress == True)! Kilitleme denetimi
+        if phase == "PLANNING":
+            return
+
         now = time.time()
-        if now - self._last_lock_attempts.get(action_id, 0) < 0.9:
+        if now - self._last_lock_attempts.get(action_id, 0) < 0.8:
             return
 
         self._last_lock_attempts[action_id] = now
+        retries = self._action_retry_counts.get(action_id, 0)
         self._action_retry_counts[action_id] = retries + 1
 
         self.log(f"Sıra bizde! Şampiyon kilitleniyor: {target_name} (ID: {target_champ}) [Deneme #{retries + 1}]")
@@ -300,29 +304,25 @@ class LcuWorker(QThread):
         else:
             self.log(f"Şampiyon kilitleme henüz tamamlanamadı: {target_name}, tekrar deneniyor...")
 
-    def handle_ban_action(self, action_id, action, unselectable, is_in_progress, phase=""):
+    def handle_ban_action(self, action_id, action, unbanable, is_in_progress, phase=""):
         if not self.config.get("auto_ban", self.config.get("auto_lock", True)):
+            return
+
+        # PLANNING (Önseçim/Niyet) aşamasında ban ekranı henüz açılmamıştır, ban denemesi yapılmaz!
+        if phase == "PLANNING":
             return
 
         # Ban işlemi SADECE ban sırası aktifken (is_in_progress == True) çalışmalıdır.
         if not is_in_progress:
             return
 
-        retries = self._action_retry_counts.get(action_id, 0)
-        # Dynamic fallback: if priority 1 fails repeatedly, try priority 2, then 3
-        pref_start = 1
-        if retries >= 4:
-            pref_start = 2
-        if retries >= 8:
-            pref_start = 3
-
         target_ban = None
         target_name = None
-        for i in range(pref_start, 4):
+        for i in range(1, 4):
             champ_name = self.config.get(f"ban_preference_{i}")
             if not champ_name or champ_name == "None": continue
             champ_id = self.ddragon.get_champion_id(champ_name)
-            if champ_id and champ_id not in unselectable:
+            if champ_id and champ_id not in unbanable:
                 target_ban = champ_id
                 target_name = champ_name
                 break
@@ -331,10 +331,11 @@ class LcuWorker(QThread):
             return
 
         now = time.time()
-        if now - self._last_lock_attempts.get(action_id, 0) < 0.9:
+        if now - self._last_lock_attempts.get(action_id, 0) < 0.8:
             return
 
         self._last_lock_attempts[action_id] = now
+        retries = self._action_retry_counts.get(action_id, 0)
         self._action_retry_counts[action_id] = retries + 1
 
         self.log(f"Ban sırası aktif! Ban kilitleniyor: {target_name} (ID: {target_ban}) [Deneme #{retries + 1}]")
